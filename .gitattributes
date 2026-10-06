@@ -1,0 +1,5 @@
+# Ensure shell scripts always retain Unix LF line endings across Windows and Linux
+*.sh text eol=lf
+*.sql text eol=lf
+*.txt text eol=lf
+Dockerfile text eol=lf
