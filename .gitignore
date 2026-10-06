@@ -10,7 +10,13 @@ shadownet/logs/*
 shadownet/captures/*
 !shadownet/captures/.gitkeep
 
+# Python cache
+__pycache__/
+*.py[cod]
+*$py.class
+
 # IDE and OS files
 .DS_Store
 Thumbs.db
 *.swp
+
